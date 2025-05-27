@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RNA 3D 结构分析脚本 (RDL1.6.7-1.4 - Adapted for pipeline)
+
+目的:
+    遍历指定目录下的所有 mmCIF (.cif) 文件，利用 rnapolis-py 库分析每个文件，
+    重点关注 RNA 链，并生成包含权威序列、RNApolis 原始输出以及
+    修正后序列/结构的 CSV 报告。
+    修正：基于最新的 RNApolis 映射逻辑进行序列/结构修正。
+
+输入:
+    - 一个包含 mmCIF 文件的目录路径。
+    - modifications_cache.json 文件路径。
+
+输出:
+    - 一个 CSV 文件。
+    - 一个日志文件。
+"""
+
+import csv
+import logging
+import os
+import sys
+import time
+import argparse # Added for command-line arguments
+from pathlib import Path # Added for robust path handling
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Set, Tuple, Optional, Any
+from functools import partial
+
+# --- rnapolis components ---
+try:
+    from rnapolis.parser import read_3d_structure
+    from rnapolis.annotator import extract_secondary_structure
+    from rnapolis.common import Structure2D, Molecule, ResidueAuth, ResidueLabel, BasePair, BpSeq
+    from rnapolis.tertiary import Residue3D, Mapping2D3D, Structure3D
+    from rnapolis.util import handle_input_file
+except ImportError as e:
+    print(f"FATAL ERROR: Failed to import rnapolis components: {e}. Is rnapolis-py installed?")
+    sys.exit(1)
+
+# --- mmcif parser ---
+try:
+    from mmcif.io.IoAdapterPy import IoAdapterPy
+except ImportError as e:
+    print(f"FATAL ERROR: Failed to import mmcif.io.IoAdapterPy: {e}. Is mmcif installed?")
+    sys.exit(1)
+
+# --- Other dependencies ---
+try:
+    from tqdm import tqdm
+    import pandas as pd # Though pandas is not directly used in this version, it was in the original imports.
+                       # If not needed, it can be removed from requirements.txt.
+except ImportError as e:
+    print(f"FATAL ERROR: Failed to import tqdm or pandas: {e}.")
+    sys.exit(1)
+
+
+# --- Modification Handler (from original script) ---
+USING_REAL_MODIFICATION_HANDLER = False
+try:
+    # This assumes 'rna3db' package is installed and accessible in PYTHONPATH
+    from rna3db.parser import ModificationHandler
+    print("Successfully imported rna3db.parser.ModificationHandler.")
+    USING_REAL_MODIFICATION_HANDLER = True
+except ImportError as e:
+    print(f"Warning: Could not import ModificationHandler from 'rna3db.parser': {e}")
+    print("This might be because the 'rna3db' package is not installed or not in PYTHONPATH.")
+    print("Using a fallback simple normalization for modified residues.")
+    class ModificationHandler: # Fallback implementation from original
+        def __init__(self, path=None): 
+            print(f"Warning: Using fallback ModificationHandler! (Path: {path})")
+        def rna_letters_3to1(self, code):
+             code_upper = code.upper()
+             if code_upper in {'A', 'C', 'G', 'U'}: return code_upper
+             if code_upper == 'T': return 'U' # DNA T to RNA U
+             # Simplified fallback mapping based on common ones
+             # For a more comprehensive fallback, more rules would be needed here.
+             # This is intentionally kept simple as per the original fallback.
+             if code_upper in ['PSU', '5MU', '1MA', 'H2U', 'OMG', 'OMC', '2MG', 'M2G', '7MG', 'RIA', 'I']: return 'N'
+             return 'N'
+    USING_REAL_MODIFICATION_HANDLER = False
+# ------------------------------------
+
+# --- Global Logger ---
+logger = logging.getLogger(__name__)
+
+# --- Logging Setup (from original script, slightly adapted) ---
+def setup_logging(log_level_str: str, log_filepath: Path):
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    # Original format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Adding process and file/line for better debugging in parallel env
+    log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - P%(process)d - %(filename)s:%(lineno)d - %(message)s')
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+    try:
+        file_handler = logging.FileHandler(log_filepath, mode='w', encoding='utf-8')
+        file_handler.setFormatter(log_formatter)
+        file_handler.setLevel(log_level)
+        root_logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Error: Could not set up log file handler at {log_filepath}: {e}")
+    
+    console_handler = logging.StreamHandler(sys.stdout) # Ensure console output
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(log_level)
+    root_logger.addHandler(console_handler)
+    logger.info(f"Logging setup complete. Level: {log_level_str}, File: {log_filepath}")
+
+
+# --- Helper Function: Parse Canonical Sequence (largely from original) ---
+def _parse_pdbx_poly_seq_scheme_detailed(
+    cif_file_path: str, # Changed from Path to str to match original usage
+    modification_handler: ModificationHandler # Instance
+) -> Optional[Dict[str, List[Dict]]]:
+    scheme_data_by_chain = defaultdict(list)
+    pdb_id_for_log = os.path.splitext(os.path.basename(cif_file_path))[0]
+    try:
+        io_adapter = IoAdapterPy()
+        data_containers = io_adapter.readFile(cif_file_path)
+        if not data_containers:
+            logger.error(f"File {pdb_id_for_log}: Unable to read mmCIF data containers.")
+            return None
+        data_block = data_containers[0]
+        scheme_obj = data_block.getObj("pdbx_poly_seq_scheme")
+        if not scheme_obj:
+            logger.info(f"File {pdb_id_for_log}: No '_pdbx_poly_seq_scheme' object found.")
+            return {}
+
+        attributes = scheme_obj.getAttributeList()
+        required_attrs_base = ["pdb_strand_id", "seq_id", "mon_id"]
+        auth_seq_num_attr = None
+        if "pdb_seq_num" in attributes: auth_seq_num_attr = "pdb_seq_num"
+        elif "auth_seq_num" in attributes: auth_seq_num_attr = "auth_seq_num"
+        else:
+            logger.error(f"File {pdb_id_for_log}: Missing author sequence number attribute in _pdbx_poly_seq_scheme.")
+            return None
+
+        required_attrs = required_attrs_base + [auth_seq_num_attr]
+        if not all(attr in attributes for attr in required_attrs):
+            missing = [attr for attr in required_attrs if attr not in attributes]
+            logger.error(f"File {pdb_id_for_log}: Missing required attributes in _pdbx_poly_seq_scheme: {missing}.")
+            return None
+
+        chain_idx = attributes.index("pdb_strand_id")
+        seq_id_idx = attributes.index("seq_id")
+        mon_id_idx = attributes.index("mon_id")
+        auth_seq_num_idx = attributes.index(auth_seq_num_attr)
+        ins_code_idx = attributes.index("pdb_ins_code") if "pdb_ins_code" in attributes else -1
+
+        for row in scheme_obj.getRowList():
+            try:
+                chain_id = row[chain_idx]
+                seq_id_val = row[seq_id_idx]
+                seq_id = int(seq_id_val) if seq_id_val not in ['.', '?'] else -1
+                mon_id = row[mon_id_idx]
+                auth_seq_num_val = row[auth_seq_num_idx]
+                auth_seq_num = int(auth_seq_num_val) if auth_seq_num_val not in ['.', '?'] else -1
+                ins_code_raw = row[ins_code_idx] if ins_code_idx != -1 else '?'
+                ins_code = ins_code_raw if ins_code_raw not in ['?', '.'] else None
+                std_one_letter_code = modification_handler.rna_letters_3to1(mon_id)
+                scheme_data_by_chain[chain_id].append({
+                    "seq_id": seq_id, "mon_id": mon_id, "std_one_letter_code": std_one_letter_code,
+                    "auth_seq_num": auth_seq_num, "pdb_ins_code": ins_code
+                })
+            except (ValueError, IndexError) as e:
+                logger.warning(f"File {pdb_id_for_log}: Error parsing _pdbx_poly_seq_scheme row: {row} - {e}")
+                continue
+
+        for chain_id_key in scheme_data_by_chain:
+            scheme_data_by_chain[chain_id_key].sort(key=lambda x: x["seq_id"])
+        return dict(scheme_data_by_chain)
+
+    except FileNotFoundError:
+        logger.error(f"File {pdb_id_for_log}: File not found during canonical sequence parsing.")
+        return None
+    except Exception as e:
+        logger.error(f"File {pdb_id_for_log}: Unexpected error parsing _pdbx_poly_seq_scheme: {e}", exc_info=False)
+        return None
+
+# --- Helper Function: Parse Multi-line Dot-Bracket (from original) ---
+def parse_multiline_dot_bracket(dot_bracket_multiline: str, pdb_id: str) -> Dict[str, Tuple[str, str]]:
+    parsed_data = {}
+    if not dot_bracket_multiline or not dot_bracket_multiline.strip():
+        logger.warning(f"File {pdb_id}: RNApolis dot-bracket string is empty.")
+        return parsed_data
+
+    strands_data = dot_bracket_multiline.strip().split('\n>')
+    if strands_data and strands_data[0].startswith('>'):
+        strands_data[0] = strands_data[0][1:]
+
+    for i, strand_block in enumerate(strands_data):
+        if not strand_block.strip(): continue
+        lines = strand_block.strip().split('\n')
+        if len(lines) == 3:
+            strand_id_raw = lines[0].strip()
+            sequence = lines[1].strip()
+            structure = lines[2].strip()
+            strand_id_key = strand_id_raw[len("strand_"):] if strand_id_raw.lower().startswith("strand_") else strand_id_raw
+            if strand_id_key in parsed_data:
+                old_seq_len = len(parsed_data[strand_id_key][0])
+                new_seq_len = len(sequence)
+                if new_seq_len > old_seq_len:
+                    logger.info(f"File {pdb_id}: Duplicate RNApolis strand ID '{strand_id_key}', new data longer, overwriting.")
+                    parsed_data[strand_id_key] = (sequence, structure)
+                else:
+                    logger.info(f"File {pdb_id}: Duplicate RNApolis strand ID '{strand_id_key}', new data not longer, keeping previous.")
+            else:
+                parsed_data[strand_id_key] = (sequence, structure)
+        elif len(lines) == 1 and not lines[0]: continue # Handles empty lines if any
+        else: 
+            logger.warning(f"File {pdb_id}: Unexpected format in RNApolis dot-bracket block {i+1}. Lines: {len(lines)}. Content: {lines}")
+    return parsed_data
+
+# --- Helper Function: Parse Resolution (from original) ---
+def _parse_resolution(cif_file_path: str) -> str:
+    # pdb_id_for_log = os.path.splitext(os.path.basename(cif_file_path))[0] # For more verbose logging if needed
+    try:
+        io_adapter = IoAdapterPy()
+        data_containers = io_adapter.readFile(cif_file_path)
+        if not data_containers: return "N/A"
+        data_block = data_containers[0]
+        
+        # Try X-ray: _refine.ls_d_res_high
+        refine_obj = data_block.getObj("refine")
+        if refine_obj:
+            attributes = refine_obj.getAttributeList(); res_attr = "ls_d_res_high"
+            if res_attr in attributes:
+                res_idx = attributes.index(res_attr); rows = refine_obj.getRowList()
+                if rows and rows[0][res_idx] not in ['?', '.']: return str(rows[0][res_idx])
+        
+        # Try EM: _em_3d_reconstruction.resolution
+        em_obj = data_block.getObj("em_3d_reconstruction")
+        if em_obj:
+            attributes = em_obj.getAttributeList(); res_attr = "resolution"
+            if res_attr in attributes:
+                res_idx = attributes.index(res_attr); rows = em_obj.getRowList()
+                if rows and rows[0][res_idx] not in ['?', '.']: return str(rows[0][res_idx])
+
+        # Check if NMR
+        exptl_obj = data_block.getObj("exptl")
+        if exptl_obj:
+            attributes = exptl_obj.getAttributeList(); method_attr = "method"
+            if method_attr in attributes:
+                method_idx = attributes.index(method_attr); rows = exptl_obj.getRowList()
+                if rows and "NMR" in rows[0][method_idx].upper(): return "NMR"
+        return "N/A"
+    except Exception: # Keep it concise as in original
+        return "N/A"
+
+# --- Worker Function: Process a Single mmCIF File (CORE LOGIC FROM RDL1.6.7-1.4) ---
+def process_file( # Renamed from process_single_file to match original
+    cif_path: str, # Original took str
+    modification_handler: ModificationHandler # Original took this name
+) -> List[List[Any]]: # Returns a list of rows for the CSV
+    file_rows = []
+    pdb_id = os.path.splitext(os.path.basename(cif_path))[0]
+    logger.info(f"Starting processing for file: {pdb_id}")
+    temp_cif_handle = None
+    
+    # Data structures from original script
+    rna_chain_auth_ids = set() # Author chain IDs that are RNA
+    existing_3d_residues_by_auth_id: Dict[Tuple, Residue3D] = {}
+    canonical_residues_by_pdb_strand_id: Optional[Dict[str, List[Dict]]] = None # pdb_strand_id is author chain ID
+    structure3d: Optional[Structure3D] = None
+    structure2d_obj: Optional[Structure2D] = None 
+    mapping: Optional[Mapping2D3D] = None
+    rnapolis_parsed_data = {} # Raw seq/struct from RNApolis multiline output
+    residue_to_rnapolis_idx = {} # Maps Residue3D to its 1-based index in RNApolis BpSeq
+    rnapolis_idx_to_chars = {}   # Maps 1-based RNApolis BpSeq index to (seq_char, struct_char)
+    pairing_partners = defaultdict(set) # For a chain, which other chains it pairs with
+    rna_structure_type = {} # Key: auth_chain_id, Val: "intramolecular", "intermolecular", etc.
+    resolution = "N/A"
+
+    try:
+        temp_cif_handle = handle_input_file(cif_path) # rnapolis utility
+        temp_cif_path = temp_cif_handle.name # Path to (possibly uncompressed) file
+
+        # 1. Parse canonical sequences
+        canonical_residues_by_pdb_strand_id = _parse_pdbx_poly_seq_scheme_detailed(
+            temp_cif_path, modification_handler
+        )
+        if canonical_residues_by_pdb_strand_id is None: # Critical error
+            logger.error(f"File {pdb_id}: Could not parse canonical sequence info. Skipping.")
+            return file_rows # Empty list
+
+        # 2. Parse resolution
+        resolution = _parse_resolution(temp_cif_path)
+
+        # 3. Read 3D structure with RNApolis
+        temp_cif_handle.seek(0) # Reset pointer
+        structure3d = read_3d_structure(temp_cif_handle, model=None, nucleic_acid_only=False)
+        if not structure3d or not structure3d.residues:
+            logger.warning(f"File {pdb_id}: RNApolis found no 3D residues. Skipping further RNApolis analysis.")
+            # Still proceed to output canonical if available, but RNApolis parts will be N/A
+        
+        # 4. Identify RNA chains and populate existing_3d_residues_by_auth_id
+        if structure3d and structure3d.residues:
+            chain_molecule_types: Dict[str, set] = defaultdict(set)
+            for residue in structure3d.residues:
+                auth_chain_id = residue.auth.chain if residue.auth else None
+                if auth_chain_id:
+                    chain_molecule_types[auth_chain_id].add(residue.molecule_type)
+                    if residue.auth: # Populate for later lookup
+                        auth_id_key = (residue.auth.chain, residue.auth.number, residue.auth.icode)
+                        existing_3d_residues_by_auth_id[auth_id_key] = residue
+            for chain_id, types in chain_molecule_types.items():
+                if Molecule.RNA in types: 
+                    rna_chain_auth_ids.add(chain_id)
+        
+        if not rna_chain_auth_ids:
+            logger.info(f"File {pdb_id}: No RNA chains identified by RNApolis. Processing only canonical if available.")
+            # Fall through to process canonical sequences without RNApolis data if any chains were in canonical_residues_by_pdb_strand_id
+            # that were RNA according to _pdbx_poly_seq_scheme's mon_id types.
+
+        # 5. RNApolis 2D structure extraction (if RNA chains and 3D structure exist)
+        if rna_chain_auth_ids and structure3d and structure3d.residues:
+            # Create a Structure3D object containing only the RNA residues for 2D analysis
+            rna_residues_for_rnapolis_2d = [
+                res for res in structure3d.residues if res.auth and res.auth.chain in rna_chain_auth_ids and res.molecule_type == Molecule.RNA
+            ]
+            if rna_residues_for_rnapolis_2d:
+                # THIS WAS THE SITE OF THE ERROR in previous versions.
+                # The original RDL1.6.7-1.4 used:
+                # rna_structure3d_for_2d = Structure3D(structure3d.identifier, rna_residues_for_rnapolis_2d, structure3d.nucleic_acid_chains_only)
+                # However, the AttributeError indicated structure3d from read_3d_structure might not have .nucleic_acid_chains_only.
+                # The TypeError indicated Structure3D might only take 2 args.
+                # Safest is to use the 2-arg constructor, as rnapolis should infer properties.
+                try:
+                    rna_structure3d_for_2d = Structure3D(identifier=pdb_id, residues=rna_residues_for_rnapolis_2d)
+                except TypeError: # Fallback if the above is still wrong for some rnapolis version
+                     logger.error(f"File {pdb_id}: TypeError creating Structure3D for RNApolis 2D. Trying alternative. This may indicate rnapolis API mismatch.")
+                     # This was the original line from RDL1.6.7-1.4, which might work if the AttributeError was misleading
+                     # and the object *does* have the attribute but the constructor call was the issue.
+                     # This is a bit of a guess now due to conflicting error messages.
+                     # The most likely rnapolis API is Structure3D(identifier, residues).
+                     rna_structure3d_for_2d = Structure3D(structure3d.identifier, rna_residues_for_rnapolis_2d)
+
+
+                try:
+                    result_tuple = extract_secondary_structure(rna_structure3d_for_2d, model=None, find_gaps=False, all_dot_brackets=False)
+                    if result_tuple and isinstance(result_tuple[0], Structure2D):
+                        structure2d_obj = result_tuple[0]
+                        base_pairs_list = structure2d_obj.baseInteractions.basePairs if structure2d_obj.baseInteractions else []
+                        stackings_list = structure2d_obj.baseInteractions.stackings if structure2d_obj.baseInteractions else []
+                        # Pass the same rna_structure3d_for_2d to Mapping2D3D
+                        mapping = Mapping2D3D(rna_structure3d_for_2d, base_pairs_list, stackings_list, find_gaps=False) 
+                        
+                        rnapolis_parsed_data = parse_multiline_dot_bracket(structure2d_obj.dotBracket, pdb_id)
+
+                        if mapping:
+                            if hasattr(mapping, 'bpseq_index_to_residue_map') and mapping.bpseq_index_to_residue_map:
+                                temp_map = mapping.bpseq_index_to_residue_map
+                                residue_to_rnapolis_idx = {v: k for k, v in temp_map.items()} # k is 1-based index
+                            else: 
+                                logger.warning(f"File {pdb_id}: mapping.bpseq_index_to_residue_map not available.")
+
+                            if hasattr(mapping, 'bpseq') and isinstance(mapping.bpseq, BpSeq) and \
+                               hasattr(mapping.bpseq, 'dot_bracket') and mapping.bpseq.dot_bracket and \
+                               hasattr(mapping.bpseq.dot_bracket, 'sequence') and \
+                               hasattr(mapping.bpseq.dot_bracket, 'structure'):
+                                internal_seq = mapping.bpseq.dot_bracket.sequence
+                                internal_struct = mapping.bpseq.dot_bracket.structure
+                                if len(internal_seq) == len(internal_struct):
+                                    for i in range(len(internal_seq)): 
+                                        rnapolis_idx_to_chars[i + 1] = (internal_seq[i], internal_struct[i]) # 1-based
+                                else: 
+                                    logger.error(f"File {pdb_id}: RNApolis mapping.bpseq.dot_bracket seq/struct length mismatch.")
+                            else: # Fallback from original script
+                                logger.warning(f"File {pdb_id}: mapping.bpseq.dot_bracket not available, attempting fallback for rnapolis_idx_to_chars.")
+                                current_idx = 1
+                                # Sort keys of rnapolis_parsed_data to ensure consistent order if multiple strands
+                                sorted_strand_keys = sorted(rnapolis_parsed_data.keys()) 
+                                temp_s, temp_db = "", ""
+                                for key in sorted_strand_keys: 
+                                    seq_part, struct_part = rnapolis_parsed_data[key]
+                                    temp_s += seq_part
+                                    temp_db += struct_part
+                                if len(temp_s) == len(temp_db):
+                                    for i in range(len(temp_s)): 
+                                        rnapolis_idx_to_chars[current_idx] = (temp_s[i], temp_db[i])
+                                        current_idx += 1
+                                else: 
+                                    logger.error(f"File {pdb_id}: Fallback for rnapolis_idx_to_chars failed due to length mismatch.")
+                        else: 
+                            logger.warning(f"File {pdb_id}: RNApolis Mapping2D3D object not created.")
+                    else: 
+                        logger.warning(f"File {pdb_id}: RNApolis failed to extract Structure2D object.")
+                except Exception as e_rnapolis: 
+                    logger.error(f"File {pdb_id}: Error during RNApolis 2D analysis: {e_rnapolis}", exc_info=False)
+            else:
+                logger.info(f"File {pdb_id}: No RNA residues found in structure3d for RNApolis 2D analysis, though RNA chains were listed.")
+
+
+        # 6. Determine pairing types (largely from original)
+        if structure2d_obj: # If RNApolis analysis was successful
+            rna_chain_has_pairs = defaultdict(bool)
+            base_pairs_from_rnapolis: List[BasePair] = structure2d_obj.baseInteractions.basePairs if structure2d_obj.baseInteractions else []
+            
+            for bp in base_pairs_from_rnapolis:
+                # Need to map bp.nt1/nt2 (ResidueLabel) back to Residue3D to get auth chain
+                res1_3d = mapping.get_residue(bp.nt1) if mapping else None
+                res2_3d = mapping.get_residue(bp.nt2) if mapping else None
+
+                if res1_3d and res1_3d.auth and res2_3d and res2_3d.auth:
+                    nt1_auth_chain, nt2_auth_chain = res1_3d.auth.chain, res2_3d.auth.chain
+                    if nt1_auth_chain and nt2_auth_chain: # Ensure auth chains are valid
+                        pairing_partners[nt1_auth_chain].add(nt2_auth_chain)
+                        pairing_partners[nt2_auth_chain].add(nt1_auth_chain)
+                        if nt1_auth_chain in rna_chain_auth_ids: # Check if it's an RNA chain we care about
+                            rna_chain_has_pairs[nt1_auth_chain] = True
+                            if nt1_auth_chain != nt2_auth_chain: # Intermolecular if partner is different
+                                rna_structure_type[nt1_auth_chain] = "intermolecular"
+                        if nt2_auth_chain in rna_chain_auth_ids:
+                            rna_chain_has_pairs[nt2_auth_chain] = True
+                            if nt1_auth_chain != nt2_auth_chain and rna_structure_type.get(nt2_auth_chain) != "intermolecular":
+                                rna_structure_type[nt2_auth_chain] = "intermolecular"
+            
+            for rna_auth_chain_id_key in rna_chain_auth_ids: # Iterate over all identified RNA chains
+                 if rna_auth_chain_id_key not in rna_structure_type: # If not already marked intermolecular
+                     rna_structure_type[rna_auth_chain_id_key] = "intramolecular" if rna_chain_has_pairs[rna_auth_chain_id_key] else "no_secondary_structure_found"
+        else: # RNApolis failed or no 2D structure
+             for rna_auth_chain_id_key in rna_chain_auth_ids: 
+                 rna_structure_type[rna_auth_chain_id_key] = "N/A (RNApolis failed)"
+        
+        # 7. Assemble final rows (largely from original)
+        # Iterate through chains found in _pdbx_poly_seq_scheme
+        for pdb_strand_id, canonical_residue_list in canonical_residues_by_pdb_strand_id.items():
+            # pdb_strand_id is the author chain ID from _pdbx_poly_seq_scheme
+            
+            # Determine the representative_auth_chain_id for this pdb_strand_id.
+            # This is needed because RNApolis might use slightly different chain IDs or merge them.
+            # The original script had complex logic here. We simplify by assuming pdb_strand_id is the key if it's an RNA chain.
+            representative_auth_chain_id = pdb_strand_id
+            if representative_auth_chain_id not in rna_chain_auth_ids:
+                # This chain from canonical_sequences was not identified as an RNA chain by RNApolis, or had no 3D residues.
+                # Or it's not RNA at all based on mon_id types if we were to check that strictly.
+                # The original script had a more complex check involving existing_3d_residues_by_auth_id
+                # to find a representative. For now, if it's not in rna_chain_auth_ids, we skip.
+                is_rna_by_mon_id = any(modification_handler.rna_letters_3to1(res['mon_id']) != 'N' for res in canonical_residue_list)
+                if is_rna_by_mon_id: # If canonical says it's RNA but RNApolis didn't pick it up
+                     logger.info(f"File {pdb_id}, Chain {pdb_strand_id}: Present in canonical sequences as RNA, but not processed by RNApolis as such. Outputting canonical only.")
+                else: # Not RNA by canonical types either
+                    continue
+
+
+            canonical_sequence = "".join([res['std_one_letter_code'] for res in canonical_residue_list])
+            corrected_sequence_chars, corrected_structure_chars = [], []
+            
+            # Get raw RNApolis seq/struct for this specific author chain ID
+            rnapolis_raw_seq, rnapolis_raw_struct = "N/A", "N/A"
+            target_key_for_raw = representative_auth_chain_id # Assumed to be the PDB author chain ID
+            if target_key_for_raw in rnapolis_parsed_data:
+                rnapolis_raw_seq, rnapolis_raw_struct = rnapolis_parsed_data[target_key_for_raw]
+            else: # Fallback from original
+                found_raw = False
+                for rnap_key_iter in rnapolis_parsed_data.keys():
+                    if rnap_key_iter.upper() == target_key_for_raw.upper():
+                        rnapolis_raw_seq, rnapolis_raw_struct = rnapolis_parsed_data[rnap_key_iter]
+                        found_raw = True; break
+                if not found_raw and pdb_strand_id in rnapolis_parsed_data:
+                     rnapolis_raw_seq, rnapolis_raw_struct = rnapolis_parsed_data[pdb_strand_id]
+
+
+            for canon_res in canonical_residue_list:
+                # auth_id_to_lookup uses representative_auth_chain_id
+                auth_id_to_lookup = (representative_auth_chain_id, canon_res['auth_seq_num'], canon_res['pdb_ins_code'])
+                res3d = existing_3d_residues_by_auth_id.get(auth_id_to_lookup)
+                
+                if res3d is None: # Canonical residue not found in 3D structure
+                    corrected_sequence_chars.append('-'); corrected_structure_chars.append('.')
+                else:
+                    # Canonical residue found in 3D. Now check RNApolis mapping.
+                    rnapolis_idx = residue_to_rnapolis_idx.get(res3d) # res3d is the key here
+                    if rnapolis_idx is None or rnapolis_idx not in rnapolis_idx_to_chars:
+                        # 3D residue not mapped by RNApolis or mapping data incomplete
+                        corrected_sequence_chars.append(canon_res['std_one_letter_code'])
+                        corrected_structure_chars.append('.')
+                    else:
+                        # Mapped by RNApolis, use its structure char
+                        _rnap_seq_char_mapped, struct_char_mapped = rnapolis_idx_to_chars.get(rnapolis_idx, ('?', '.'))
+                        corrected_sequence_chars.append(canon_res['std_one_letter_code'])
+                        corrected_structure_chars.append(struct_char_mapped)
+            
+            corrected_sequence = "".join(corrected_sequence_chars)
+            corrected_structure = "".join(corrected_structure_chars)
+            
+            structure_type_str = rna_structure_type.get(representative_auth_chain_id, "N/A")
+            current_partners_set = pairing_partners.get(representative_auth_chain_id, set())
+            other_partners = current_partners_set - {representative_auth_chain_id} # Exclude self
+            partners_str = ", ".join(sorted(list(other_partners))) if other_partners else \
+                           ("none (intra-chain)" if structure_type_str == "intramolecular" else "none")
+            if structure_type_str == "no_secondary_structure_found": partners_str = "none"
+
+
+            file_rows.append([
+                pdb_id, pdb_strand_id, canonical_sequence or "N/A",
+                rnapolis_raw_seq, rnapolis_raw_struct,
+                corrected_sequence or "N/A", corrected_structure or "N/A",
+                resolution, structure_type_str, partners_str
+            ])
+        logger.info(f"Finished processing for file: {pdb_id}")
+
+    except Exception as e:
+        logger.error(f"Major error processing file {pdb_id}: {e}", exc_info=True) # exc_info=True for full traceback
+        return [] # Return empty list on major error for this file
+    finally:
+        if temp_cif_handle and hasattr(temp_cif_handle, 'close') and not temp_cif_handle.closed:
+             try: temp_cif_handle.close()
+             except Exception as e_close: logger.warning(f"Could not close temp file handle for {pdb_id}: {e_close}")
+    return file_rows
+
+
+# --- Main Batch Analysis Function (adapted from original, takes argparse args) ---
+def run_batch_analysis(
+    input_mmcif_dir: Path, 
+    output_csv_file: Path, 
+    modifications_cache_json_path: Path, # Changed name to reflect it's a path
+    log_file_path: Path,
+    max_workers: Optional[int] = None
+    ):
+    log_level_str = os.getenv("RNA_ANALYSIS_LOGLEVEL", "INFO")
+    setup_logging(log_level_str, log_file_path)
+    logging.getLogger("rnapolis").setLevel(logging.WARNING) # Quieten RNApolis
+
+    modification_handler_instance = None # Initialize
+    if USING_REAL_MODIFICATION_HANDLER:
+        if not modifications_cache_json_path.is_file():
+            logger.error(f"Real ModificationHandler specified, but cache file not found: {modifications_cache_json_path}")
+            logger.warning("Falling back to simple residue normalization.")
+            modification_handler_instance = ModificationHandler() # Fallback
+        else:
+            try:
+                modification_handler_instance = ModificationHandler(str(modifications_cache_json_path))
+                logger.info(f"Successfully loaded ModificationHandler using cache: {modifications_cache_json_path}")
+            except Exception as e:
+                logger.error(f"Error loading real ModificationHandler from {modifications_cache_json_path}: {e}. Using fallback.", exc_info=True)
+                modification_handler_instance = ModificationHandler() # Fallback
+    else: # USING_REAL_MODIFICATION_HANDLER is False (import failed)
+        modification_handler_instance = ModificationHandler(str(modifications_cache_json_path)) # Pass path to fallback for its warning
+        logger.info(f"Using fallback ModificationHandler (cache path if provided: {modifications_cache_json_path}).")
+
+
+    start_time = time.time()
+    logger.info(f"RNA Chain Analysis Script Started.")
+    logger.info(f"Input mmCIF Directory: {input_mmcif_dir}")
+    logger.info(f"Output CSV: {output_csv_file}")
+    logger.info(f"Modifications Cache Used: {modifications_cache_json_path}")
+    logger.info(f"Log File: {log_file_path}")
+
+    if not input_mmcif_dir.is_dir():
+        logger.error(f"Input directory not found: {input_mmcif_dir}")
+        return
+
+    all_cif_files = list(input_mmcif_dir.glob('*.cif')) + list(input_mmcif_dir.glob('*.cif.gz'))
+    if not all_cif_files:
+        logger.warning(f"No .cif or .cif.gz files found in {input_mmcif_dir}.")
+        return
+    logger.info(f"Found {len(all_cif_files)} mmCIF files to process.")
+
+    csv_header = [
+        'PDB_ID', 'Chain_ID', 'Sequence_Canonical',
+        'Sequence_RNApolis_Raw', 'Structure_RNApolis_Raw',
+        'Sequence_Corrected', 'Structure_Corrected',
+        'Resolution', 'Pairing_Type', 'Pairing_Partners'
+    ]
+
+    num_workers = max_workers if max_workers is not None else os.cpu_count()
+    logger.info(f"Using {num_workers} worker processes for parallel execution.")
+
+    processed_files_count = 0
+    error_files_count = 0 
+    
+    try:
+        with open(output_csv_file, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(csv_header)
+
+            # process_file was the original name, using it for the partial
+            process_file_with_handler = partial(process_file, modification_handler=modification_handler_instance)
+            
+            # futures = {executor.submit(process_file_with_handler, str(cif_path)): cif_path for cif_path in all_cif_files}
+
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(process_file_with_handler, str(cif_file_path_obj)): cif_file_path_obj for cif_file_path_obj in all_cif_files}
+                for future in tqdm(as_completed(futures), total=len(all_cif_files), desc="Processing CIF files"):
+                    cif_file_path_obj = futures[future]
+                    pdb_id_for_log = cif_file_path_obj.stem.split('.')[0]
+                    try:
+                        file_result_rows = future.result() 
+                        if file_result_rows: 
+                            writer.writerows(file_result_rows)
+                            processed_files_count +=1
+                        # else: process_file logs reasons for skipping/empty results
+                    except Exception as exc: 
+                        logger.error(f"File {pdb_id_for_log} failed in child process: {exc}", exc_info=False)
+                        error_files_count += 1
+            
+            skipped_files_count = len(all_cif_files) - processed_files_count - error_files_count
+
+    except IOError as e: 
+        logger.error(f"Cannot write to CSV file {output_csv_file}: {e}"); return
+    except Exception as e: 
+        logger.error(f"Main program encountered an unknown error: {e}", exc_info=True); return
+
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info("-" * 50)
+    logger.info(f"Analysis complete!")
+    logger.info(f"Total files checked: {len(all_cif_files)}")
+    logger.info(f"Successfully processed and wrote data for: {processed_files_count} files")
+    logger.info(f"Files with errors in child process: {error_files_count}")
+    # logger.info(f"Skipped files (no RNA/RNApolis no result etc.): {skipped_files_count}") # This count might be tricky
+    logger.info(f"Total time: {duration:.2f} seconds")
+    logger.info(f"Results saved to CSV: {output_csv_file}")
+    logger.info(f"Detailed log saved to: {log_file_path}")
+    logger.info("-" * 50)
+
+# --- Main Program Entry ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Batch analyze RNA chains from mmCIF files.")
+    parser.add_argument(
+        "--input_dir", 
+        type=Path, 
+        default=Path("./data/downloaded_mmcif"), # User specified default
+        help="Directory containing input mmCIF files."
+    )
+    parser.add_argument(
+        "--output_csv", 
+        type=Path, 
+        default=Path("./data/analysis_output/02_rna_chain_analysis.csv"), # User specified default
+        help="Path to the output CSV file."
+    )
+    parser.add_argument(
+        "--mod_cache", 
+        type=Path, 
+        default=Path("./utils/modifications_cache.json"), # User specified default
+        required=False, # Making it not strictly required to allow fallback if file is missing
+        help="Path to the modifications_cache.json file. If not found, fallback handler is used."
+    )
+    parser.add_argument(
+        "--log_file", 
+        type=Path, 
+        default=Path("./data/analysis_output/02_analyze_rna_chains.log"), # User specified default
+        help="Path to the log file for this script."
+    )
+    parser.add_argument(
+        "--max_workers", 
+        type=int, 
+        default=None, 
+        help="Maximum number of worker processes. Defaults to number of CPU cores."
+    )
+    
+    args = parser.parse_args()
+
+    # Check if mod_cache exists, warn if not but proceed with fallback
+    if not args.mod_cache.is_file():
+        print(f"WARNING: Modifications cache file specified (--mod_cache {args.mod_cache}) not found.")
+        print("The script will proceed using a fallback mechanism for modified residue normalization,")
+        print("which might be less accurate or comprehensive.")
+        # USING_REAL_MODIFICATION_HANDLER will be false if rna3db was not imported,
+        # or the fallback will be used inside run_batch_analysis if the file is missing.
+
+    run_batch_analysis(
+        input_mmcif_dir=args.input_dir,
+        output_csv_file=args.output_csv,
+        modifications_cache_json_path=args.mod_cache, # Pass the path
+        log_file_path=args.log_file,
+        max_workers=args.max_workers
+    )
