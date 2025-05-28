@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script to assign dataset partition information (train/valid/test) from a
-resplit JSON file to a DataFrame of filtered and selected RNA chains.
+Script to assign dataset information (train_set, valid_set, test_set) to filtered
+and selected RNA chains from the previous step. This script reads the filtered and
+selected chains CSV and the resplit JSON, then merges them to create final CSV files.
 
-This script performs operations similar to step 9 in the original
-RDL1.6.7-1.5_valid_chain_selection.ipynb notebook.
+此脚本将数据集信息（train_set, valid_set, test_set）分配给上一步过滤和选择的RNA链。
+脚本读取过滤和选择的链CSV以及resplit JSON，然后合并它们以创建最终的CSV文件。
 """
 
 import pandas as pd
 import json
-import argparse
 import sys
-from pathlib import Path
 import logging
+from pathlib import Path
+from typing import Optional
 
 # --- Global Logger ---
 logger = logging.getLogger(__name__)
@@ -44,117 +45,151 @@ def setup_logging(log_level_str: str = "INFO", log_filepath: Optional[Path] = No
     logger.info(f"Logging setup complete. Level: {log_level_str}{', File: ' + str(log_filepath) if log_filepath else ''}")
 
 
-def parse_resplit_json_to_dataset_map(resplit_json_path: Path) -> dict:
+def parse_resplit_json_to_dataframe(resplit_json_path: Path) -> pd.DataFrame:
     """
-    Parses the resplit JSON (output of 04_resplit_dataset.sh) and creates a
-    mapping from 'repr_pdb_chain' to its assigned dataset (train_set, valid_set, test_set).
-
-    解析 resplit JSON（04_resplit_dataset.sh 的输出）并创建一个从 'repr_pdb_chain'
-    到其分配的数据集（train_set, valid_set, test_set）的映射。
-
+    解析 resplit JSON 文件为 DataFrame，与 notebook 中的 read_dataset_partition 函数一致。
+    Parse resplit JSON file into a DataFrame, consistent with the read_dataset_partition function in the notebook.
+    
     Args:
-        resplit_json_path (Path): Path to the resplit JSON file.
-                                  resplit JSON 文件的路径。
+        resplit_json_path (Path): resplit JSON 文件路径
+                                  Path to the resplit JSON file.
+        
     Returns:
-        dict: A dictionary mapping repr_pdb_chain (str) to dataset_name (str).
-              一个将 repr_pdb_chain (str) 映射到 dataset_name (str) 的字典。
+        pd.DataFrame: 包含 dataset, component, repr_pdb_chain, pdb_chain_id 列的 DataFrame
+                     DataFrame with dataset, component, repr_pdb_chain, pdb_chain_id columns.
     """
-    logger.info(f"Parsing resplit dataset JSON from: {resplit_json_path}")
+    logger.info(f"Parsing resplit JSON from: {resplit_json_path}")
     with open(resplit_json_path, 'r') as f:
-        resplit_data = json.load(f)
+        data = json.load(f)
     
-    repr_to_dataset_map = {}
-    # Structure of resplit_data:
-    # {
-    #   "train_set": {"component_X": {"repr_pdb_A": {...}, "repr_pdb_B": {...}}, ...},
-    #   "valid_set": {"component_Y": {"repr_pdb_C": {...}}, ...},
-    #   "test_set":  {"component_Z": {"repr_pdb_D": {...}}, ...}
-    # }
-    for dataset_name, components in resplit_data.items():
-        for component_id, repr_pdb_clusters in components.items():
-            for repr_pdb_chain_id in repr_pdb_clusters.keys():
-                if repr_pdb_chain_id in repr_to_dataset_map:
-                    logger.warning(f"Representative PDB chain '{repr_pdb_chain_id}' found in multiple datasets ('{repr_to_dataset_map[repr_pdb_chain_id]}' and '{dataset_name}'). This should not happen with rna3db split. Using the first encountered: '{repr_to_dataset_map[repr_pdb_chain_id]}'.")
-                else:
-                    repr_to_dataset_map[repr_pdb_chain_id] = dataset_name
+    rows = []
+    for dataset, components in data.items():
+        for component, pdbs in components.items():
+            for repr_pdb_chain, chains in pdbs.items():
+                for pdb_chain_id, metas in chains.items():
+                    row = {
+                        "dataset": dataset,
+                        "component": component,
+                        "repr_pdb_chain": repr_pdb_chain,
+                        "pdb_chain_id": pdb_chain_id
+                    }
+                    # 添加所有元数据 (Add all metadata)
+                    row.update(metas)
+                    rows.append(row)
     
-    logger.info(f"Created map for {len(repr_to_dataset_map)} representative PDB chains to their datasets.")
-    return repr_to_dataset_map
+    split_df = pd.DataFrame(rows)
+    logger.info(f"Parsed resplit JSON into DataFrame with {len(split_df)} rows.")
+    return split_df
+
+
+def assign_dataset_info(filtered_selected_csv: Path, resplit_json: Path, 
+                       output_final_all_info_csv: Path, output_final_selected_dataset_csv: Path):
+    """
+    分配数据集信息，使用与 notebook 相同的合并方式。
+    Assign dataset information using the same merging method as in the notebook.
+    
+    Args:
+        filtered_selected_csv (Path): 过滤和选择的链CSV文件路径
+                                      Path to the filtered and selected chains CSV file.
+        resplit_json (Path): resplit JSON 文件路径
+                            Path to the resplit JSON file.
+        output_final_all_info_csv (Path): 输出包含所有链的最终CSV文件路径
+                                         Path to the output final CSV file with all chains.
+        output_final_selected_dataset_csv (Path): 最终用于训练的RNA3DB dataset，输出仅包含选定序列的最终CSV文件路径
+                                              Path to the output final CSV file with only selected sequences.
+    """
+    logger.info(f"Loading filtered and selected chains from: {filtered_selected_csv}")
+    df = pd.read_csv(filtered_selected_csv)
+    logger.info(f"Loaded {len(df)} chains from filtered CSV.")
+    
+    # 解析 resplit JSON 为 DataFrame（与 notebook 一致）
+    # Parse resplit JSON to DataFrame (consistent with notebook)
+    split_df = parse_resplit_json_to_dataframe(resplit_json)
+    
+    # 使用与 notebook 相同的合并方式：left_on='full_id', right_on='pdb_chain_id'
+    # Use the same merging method as in the notebook: left_on='full_id', right_on='pdb_chain_id'
+    logger.info("Merging dataset information using full_id and pdb_chain_id...")
+    final_df = pd.merge(df, split_df, left_on='full_id', right_on='pdb_chain_id', how='left')
+    
+    # 检查未分配的链
+    # Check for unassigned chains
+    unassigned_count = final_df['dataset'].isna().sum()
+    if unassigned_count > 0:
+        logger.warning(f"Found {unassigned_count} chains without dataset assignment.")
+        # 将未分配的标记为 'unassigned'
+        # Mark unassigned chains as 'unassigned'
+        final_df['dataset'] = final_df['dataset'].fillna('unassigned')
+    
+    logger.info(f"Dataset assignment complete. Final DataFrame has {len(final_df)} rows.")
+    
+    # 显示数据集分布
+    # Display dataset distribution
+    dataset_counts = final_df['dataset'].value_counts()
+    logger.info(f"Dataset distribution: {dataset_counts.to_dict()}")
+    
+    # 保存包含所有信息的 CSV
+    # Save CSV with all information
+    logger.info(f"Saving final all info CSV to: {output_final_all_info_csv}")
+    final_df.to_csv(output_final_all_info_csv, index=False)
+    
+    # 保存只包含选定序列的 CSV（is_selected == 1）
+    # Save CSV with only selected sequences (is_selected == 1)
+    final_selected_df = final_df[final_df['is_selected'] == 1].copy()
+    logger.info(f"Saving final selected sequences CSV to: {output_final_selected_dataset_csv}")
+    logger.info(f"Selected sequences count: {len(final_selected_df)}")
+    final_selected_df.to_csv(output_final_selected_dataset_csv, index=False)
+    
+    # 显示选定序列的数据集分布
+    # Display dataset distribution for selected sequences
+    selected_dataset_counts = final_selected_df['dataset'].value_counts()
+    logger.info(f"Selected sequences dataset distribution: {selected_dataset_counts.to_dict()}")
+    
+    logger.info("Dataset assignment completed successfully.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Assign dataset partition info to filtered/selected RNA chains.")
-    parser.add_argument("filtered_selected_csv", type=Path, help="Path to the CSV from 03_filter_select_chains.py (output_filtered_selected_csv).")
-    parser.add_argument("resplit_json", type=Path, help="Path to the resplit JSON file from 04_resplit_dataset.sh.")
-    parser.add_argument("output_final_all_info_csv", type=Path, help="Path to save the final CSV containing ALL chains with dataset assignments.")
-    parser.add_argument("output_final_selected_seqs_csv", type=Path, help="Path to save the final CSV containing ONLY SELECTED chains with dataset assignments (for BPSEQ generation).")
-    parser.add_argument("--log_file", type=Path, default=None, help="Optional path to a log file.")
-    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level.")
-
+    """
+    Main function to parse command line arguments and run the script.
+    解析命令行参数并运行脚本的主函数。
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Assign dataset information to filtered and selected RNA chains.")
+    parser.add_argument("--filtered_selected_csv", type=Path, 
+                        default=Path("./data/analysis_output/03_filtered_selected_chains.csv"),
+                        help="Path to the filtered and selected chains CSV file from 03_filter_select_chains.py.")
+    parser.add_argument("--resplit_json", type=Path, 
+                        default=Path("./data/analysis_output/04_resplit.json"),
+                        help="Path to the resplit JSON file from 04_resplit_dataset.sh.")
+    parser.add_argument("--output_final_all_info_csv", type=Path, 
+                        default=Path("./data/analysis_output/05_final_all_info.csv"),
+                        help="Path to save the CSV with all chains and dataset information.")
+    parser.add_argument("--output_final_selected_dataset_csv", type=Path, 
+                        default=Path("./data/analysis_output/05_final_selected_dataset.csv"),
+                        help="Path to save the CSV with only selected sequences and dataset information.")
+    parser.add_argument("--log_file", type=Path, default="./data/analysis_output/05_assgin_dataset_info.log", 
+                        help="Optional path to a log file.")
+    parser.add_argument("--log_level", type=str, default="INFO", 
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], 
+                        help="Logging level.")
+    
     args = parser.parse_args()
-
+    
+    # Setup logging
     setup_logging(log_level_str=args.log_level, log_filepath=args.log_file)
-
-    # --- 1. Load filtered and selected chains CSV ---
-    logger.info(f"Loading filtered and selected chains data from: {args.filtered_selected_csv}")
-    try:
-        df_chains = pd.read_csv(args.filtered_selected_csv)
-    except FileNotFoundError:
-        logger.error(f"Filtered/selected chains CSV file not found: {args.filtered_selected_csv}")
-        sys.exit(1)
-    logger.info(f"Loaded {len(df_chains)} chains.")
     
-    if 'repr_pdb_chain' not in df_chains.columns:
-        logger.error(f"Critical column 'repr_pdb_chain' not found in {args.filtered_selected_csv}. This column is needed to map dataset assignments.")
-        sys.exit(1)
-    if 'is_selected' not in df_chains.columns:
-        logger.warning(f"Column 'is_selected' not found in {args.filtered_selected_csv}. Will assume all chains are to be processed if filtering for selected ones later.")
-        # Add a default 'is_selected' = 1 if it's missing, so the script doesn't break,
-        # but this indicates a potential issue in the upstream script (03).
-        df_chains['is_selected'] = 1
-
-
-    # --- 2. Parse resplit JSON to get dataset assignments for representative PDBs ---
-    repr_to_dataset_map = parse_resplit_json_to_dataset_map(args.resplit_json)
-    if not repr_to_dataset_map:
-        logger.warning(f"The resplit JSON ({args.resplit_json}) resulted in an empty map. No dataset assignments can be made.")
-        # Create an empty 'dataset' column and save.
-        df_chains['dataset'] = "unassigned"
-    else:
-        # --- 3. Map dataset assignment to each chain in df_chains ---
-        # Each chain in df_chains belongs to a 'repr_pdb_chain'.
-        # We use this 'repr_pdb_chain' to look up its dataset from the map.
-        logger.info("Mapping dataset assignments to chains...")
-        df_chains['dataset'] = df_chains['repr_pdb_chain'].map(repr_to_dataset_map)
-        
-        unassigned_count = df_chains['dataset'].isna().sum()
-        if unassigned_count > 0:
-            logger.warning(f"{unassigned_count} chains could not be assigned to a dataset. Their 'repr_pdb_chain' might not be in the resplit JSON. They will be marked as 'unassigned'.")
-            df_chains['dataset'].fillna('unassigned', inplace=True)
-
-    # --- 4. Save the DataFrame with all chains and their dataset assignments ---
-    df_chains.to_csv(args.output_final_all_info_csv, index=False)
-    logger.info(f"Final CSV with all chains and dataset assignments saved to: {args.output_final_all_info_csv}")
-
-    # --- 5. Filter for only selected chains and save ---
-    logger.info("Filtering for 'is_selected == 1' chains for BPSEQ generation input...")
-    df_final_selected_seqs = df_chains[df_chains['is_selected'] == 1].copy()
+    # Ensure output directories exist
+    args.output_final_all_info_csv.parent.mkdir(parents=True, exist_ok=True)
+    args.output_final_selected_dataset_csv.parent.mkdir(parents=True, exist_ok=True)
     
-    # Sanity check: ensure all selected sequences were assigned a dataset (unless map was empty)
-    if repr_to_dataset_map: # Only check if assignments were expected
-        unassigned_selected_count = df_final_selected_seqs[df_final_selected_seqs['dataset'] == 'unassigned'].shape[0]
-        if unassigned_selected_count > 0:
-             logger.error(f"CRITICAL: {unassigned_selected_count} chains marked as 'is_selected == 1' were NOT assigned a dataset. This indicates an inconsistency between selected representatives and the resplit JSON content.")
-             # This could happen if a 'repr_pdb_chain' that had a selected member was somehow excluded from the input to 04_resplit_dataset.sh
-        else:
-            logger.info(f"All {len(df_final_selected_seqs)} selected chains were successfully assigned a dataset (or marked 'unassigned' if resplit map was empty).")
+    # Run the main function
+    assign_dataset_info(
+        filtered_selected_csv=args.filtered_selected_csv,
+        resplit_json=args.resplit_json,
+        output_final_all_info_csv=args.output_final_all_info_csv,
+        output_final_selected_dataset_csv=args.output_final_selected_dataset_csv
+    )
 
-
-    df_final_selected_seqs.to_csv(args.output_final_selected_seqs_csv, index=False)
-    logger.info(f"Final CSV with ONLY SELECTED chains and dataset assignments saved to: {args.output_final_selected_seqs_csv}")
-    logger.info(f"This file contains {len(df_final_selected_seqs)} sequences and will be used for BPSEQ generation.")
-    
-    logger.info("Script finished successfully.")
 
 if __name__ == "__main__":
     main()

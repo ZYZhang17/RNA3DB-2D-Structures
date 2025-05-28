@@ -12,28 +12,42 @@ set -e # Exit immediately if a command exits with a non-zero status.
 set -u # Treat unset variables as an error when substituting.
 set -o pipefail # Return value of a pipeline is the value of the last command to exit with a non-zero status
 
+# --- Default Values ---
+DEFAULT_INPUT_JSON="./data/analysis_output/03_selected_clusters.json"
+DEFAULT_OUTPUT_JSON="./data/analysis_output/04_resplit.json"
+DEFAULT_TRAIN_RATIO="0.6"
+DEFAULT_VALID_RATIO="0.2"
+DEFAULT_FORCE_ZERO_TEST="True"
+
 # --- Argument Parsing ---
-if [ "$#" -lt 4 ]; then
-    echo "Usage: $0 <input_selected_clusters.json> <output_resplit.json> <train_ratio> <valid_ratio> [--force_zero_test]"
-    echo "  <input_selected_clusters.json>: Path to the JSON file containing clusters to be split."
-    echo "                                    (e.g., output from 03_filter_select_chains.py)"
-    echo "  <output_resplit.json>: Path for the output JSON file with dataset splits."
-    echo "  <train_ratio>: Proportion for the training set (e.g., 0.6)."
-    echo "  <valid_ratio>: Proportion for the validation set (e.g., 0.2)."
-    echo "  [--force_zero_test]: Optional. If provided, forces component_0 (if present) into the test set."
-    exit 1
-fi
+# 使用提供的参数或默认值
+INPUT_JSON="${1:-$DEFAULT_INPUT_JSON}"
+OUTPUT_JSON="${2:-$DEFAULT_OUTPUT_JSON}"
+TRAIN_RATIO="${3:-$DEFAULT_TRAIN_RATIO}"
+VALID_RATIO="${4:-$DEFAULT_VALID_RATIO}"
 
-INPUT_JSON="$1"
-OUTPUT_JSON="$2"
-TRAIN_RATIO="$3"
-VALID_RATIO="$4"
-FORCE_ZERO_TEST_FLAG=""
-
-# Check for optional flag
-if [[ "${5:-}" == "--force_zero_test" ]]; then
+# 第5个参数如果是--force_zero_test或未提供且默认为True，则设置标志
+if [[ "${5:-}" == "--force_zero_test" || ($# -lt 5 && "$DEFAULT_FORCE_ZERO_TEST" == "True") ]]; then
     FORCE_ZERO_TEST_FLAG="--force_zero_test"
     echo "INFO: --force_zero_test flag is set. Component_0 will be forced into the test set if present."
+else
+    FORCE_ZERO_TEST_FLAG=""
+fi
+
+# 显示使用说明（如果使用-h或--help）
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "Usage: $0 [<input_json>] [<output_json>] [<train_ratio>] [<valid_ratio>] [--force_zero_test]"
+    echo "  <input_json>: Path to the JSON file containing clusters to be split."
+    echo "                 Default: $DEFAULT_INPUT_JSON"
+    echo "  <output_json>: Path for the output JSON file with dataset splits."
+    echo "                 Default: $DEFAULT_OUTPUT_JSON"
+    echo "  <train_ratio>: Proportion for the training set."
+    echo "                 Default: $DEFAULT_TRAIN_RATIO"
+    echo "  <valid_ratio>: Proportion for the validation set."
+    echo "                 Default: $DEFAULT_VALID_RATIO"
+    echo "  --force_zero_test: If provided, forces component_0 (if present) into the test set."
+    echo "                     Default: $(if [[ "$DEFAULT_FORCE_ZERO_TEST" == "True" ]]; then echo "Enabled"; else echo "Disabled"; fi)"
+    exit 0
 fi
 
 # --- Validation ---
@@ -65,10 +79,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# --- Run rna3db split command ---
-# The rna3db library needs to be installed and accessible in the environment.
-# The command structure is: python -m rna3db split <input> <output> --train_ratio X --valid_ratio Y [--force_zero_test]
-echo "INFO: Running rna3db split..."
+# --- Run local split command ---
+echo "INFO: Running local split function..."
 echo "  Input: $INPUT_JSON"
 echo "  Output: $OUTPUT_JSON"
 echo "  Train Ratio: $TRAIN_RATIO"
@@ -77,23 +89,37 @@ if [ -n "$FORCE_ZERO_TEST_FLAG" ]; then
     echo "  Force Zero Test: Enabled"
 fi
 
-# Construct the command
-COMMAND=(python -m rna3db split \
-    "$INPUT_JSON" \
-    "$OUTPUT_JSON" \
-    --train_ratio "$TRAIN_RATIO" \
-    --valid_ratio "$VALID_RATIO")
+# Calculate test ratio
+TEST_RATIO=$(python -c "print(1.0 - $TRAIN_RATIO - $VALID_RATIO)")
 
-if [ -n "$FORCE_ZERO_TEST_FLAG" ]; then
-    COMMAND+=("$FORCE_ZERO_TEST_FLAG")
-fi
+# Create Python script to call split function
+PYTHON_SCRIPT="
+import sys
+from pathlib import Path
 
-# Execute the command
-"${COMMAND[@]}"
+# Add scripts directory to Python path
+scripts_dir = Path('$0').parent.absolute()
+sys.path.insert(0, str(scripts_dir))
+
+from utils import split
+
+# Call split function
+split(
+    input_path='$INPUT_JSON',
+    output_path='$OUTPUT_JSON',
+    splits=[$TRAIN_RATIO, $VALID_RATIO, $TEST_RATIO],
+    split_names=['train_set', 'valid_set', 'test_set'],
+    shuffle=False,
+    force_zero_last=$(if [ -n "$FORCE_ZERO_TEST_FLAG" ]; then echo "True"; else echo "False"; fi)
+)
+"
+
+# Execute the Python script
+python -c "$PYTHON_SCRIPT"
 
 # Check execution result
 if [ $? -ne 0 ]; then
-    echo "ERROR: rna3db split command failed. Check rna3db logs or output for details."
+    echo "ERROR: split command failed. Check logs for details."
     exit 1
 else
     echo "INFO: Successfully generated resplit dataset: $OUTPUT_JSON"

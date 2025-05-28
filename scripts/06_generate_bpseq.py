@@ -192,13 +192,24 @@ def process_dataframe_to_bpseq_files(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate BPSEQ files from RNA sequence and structure data.")
-    parser.add_argument("input_selected_seqs_csv", type=Path, help="Path to the CSV file containing selected sequences and their dataset assignments (output of 05_assign_dataset_info.py).")
-    parser.add_argument("output_bpseq_dir", type=Path, help="Base directory to save the generated BPSEQ files (subdirectories per dataset will be created).")
-    parser.add_argument("--generate_less_600nt", action="store_true", help="If set, also generate a separate set of BPSEQ files for sequences with canonical length < 600nt.")
-    parser.add_argument("--less_600nt_subdir_name", type=str, default="bpseq_less600nt", help="Subdirectory name within output_bpseq_dir for sequences < 600nt, if --generate_less_600nt is set.")
-    parser.add_argument("--log_file", type=Path, default=None, help="Optional path to a log file.")
-    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level.")
-
+    parser.add_argument("--input_selected_seqs_csv", type=Path, 
+                        default=Path("./data/analysis_output/05_final_selected_dataset.csv"),
+                        help="Path to the CSV file containing selected sequences and their dataset assignments (output of 05_assign_dataset_info.py).")
+    parser.add_argument("--output_bpseq_dir", type=Path, 
+                        default=Path("./data/analysis_output/06_bpseq"),
+                        help="Base directory to save the generated BPSEQ files (subdirectories per dataset will be created).")
+    parser.add_argument("--generate_less_600nt", action="store_true", 
+                        help="If set, also generate a separate set of BPSEQ files for sequences with canonical length < 600nt.")
+    parser.add_argument("--less_600nt_subdir_name", type=str, 
+                        default="bpseq_less600nt", 
+                        help="Subdirectory name within output_bpseq_dir for sequences < 600nt, if --generate_less_600nt is set.")
+    parser.add_argument("--log_file", type=Path, 
+                        default=Path("./data/analysis_output/06_generate_bpseq.log"), 
+                        help="Optional path to a log file.")
+    parser.add_argument("--log_level", type=str, 
+                        default="INFO", 
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], 
+                        help="Logging level.")
     args = parser.parse_args()
 
     setup_logging(log_level_str=args.log_level, log_filepath=args.log_file)
@@ -232,31 +243,36 @@ def main():
     if args.generate_less_600nt:
         logger.info("--- Generating BPSEQ files for selected sequences with canonical length < 600nt ---")
         
-        # Ensure 'Sequence_Canonical' column exists for length check
-        if 'Sequence_Canonical' not in df_selected_seqs.columns:
-            logger.error("Column 'Sequence_Canonical' needed for length filtering (<600nt) is not found. Skipping this step.")
-        else:
-            # Calculate length of canonical sequence for filtering
-            # Handle NaN or non-string sequences gracefully
+        # 使用与notebook一致的长度列 (rna3db_seq_length)
+        if 'rna3db_seq_length' in df_selected_seqs.columns:
+            # 优先使用rna3db_seq_length列（与RDL1.6.7-1.5 notebook一致）
+            df_less_600nt = df_selected_seqs[df_selected_seqs['rna3db_seq_length'] < 600].copy()
+            logger.info(f"Using 'rna3db_seq_length' column for length filtering. Found {len(df_less_600nt)} sequences < 600nt.")
+        elif 'Sequence_Canonical' in df_selected_seqs.columns:
+            # 备选方案：计算Sequence_Canonical长度（与原代码逻辑一致）
+            logger.warning("Column 'rna3db_seq_length' not found. Using calculated length from 'Sequence_Canonical' as fallback.")
             df_selected_seqs['temp_canonical_length'] = df_selected_seqs['Sequence_Canonical'].apply(
                 lambda x: len(x) if isinstance(x, str) else 0
             )
             df_less_600nt = df_selected_seqs[df_selected_seqs['temp_canonical_length'] < 600].copy()
             df_less_600nt.drop(columns=['temp_canonical_length'], inplace=True)
+            logger.info(f"Found {len(df_less_600nt)} sequences with canonical length < 600nt.")
+        else:
+            logger.error("Neither 'rna3db_seq_length' nor 'Sequence_Canonical' column found for length filtering. Skipping <600nt processing.")
+            df_less_600nt = pd.DataFrame()  # 空DataFrame，跳过后续处理
 
-            if df_less_600nt.empty:
-                logger.info("No selected sequences found with canonical length < 600nt.")
-            else:
-                logger.info(f"Found {len(df_less_600nt)} selected sequences with canonical length < 600nt.")
-                output_dir_less_600nt = args.output_bpseq_dir / args.less_600nt_subdir_name
-                process_dataframe_to_bpseq_files(
-                    df=df_less_600nt,
-                    base_output_dir=output_dir_less_600nt,
-                    seq_col='Sequence_Canonical',
-                    struct_col='Structure_Corrected',
-                    id_col='full_id',
-                    dataset_col='dataset'
-                )
+        if not df_less_600nt.empty:
+            output_dir_less_600nt = args.output_bpseq_dir / args.less_600nt_subdir_name
+            process_dataframe_to_bpseq_files(
+                df=df_less_600nt,
+                base_output_dir=output_dir_less_600nt,
+                seq_col='Sequence_Canonical',
+                struct_col='Structure_Corrected',
+                id_col='full_id',
+                dataset_col='dataset'
+            )
+        else:
+            logger.info("No sequences found for <600nt processing or processing was skipped due to missing columns.")
     
     logger.info("Script finished successfully.")
 

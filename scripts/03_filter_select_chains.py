@@ -15,6 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 import logging
+from typing import Optional
 
 # --- Global Logger ---
 logger = logging.getLogger(__name__)
@@ -134,8 +135,8 @@ def select_representative_chain(df_group: pd.DataFrame, random_seed: int = 66) -
                    所选代表链的行。
     """
     # Ensure resolution is numeric, coercing errors to NaN, then fill NaN with a high value for min()
-    df_group['resolution_numeric'] = pd.to_numeric(df_group['resolution'], errors='coerce').fillna(float('inf'))
-
+    df_group['resolution_numeric'] = pd.to_numeric(df_group['Resolution'], errors='coerce').fillna(float('inf'))
+    
     # 1. Resolution: Lower is better
     min_res = df_group['resolution_numeric'].min()
     df1 = df_group[df_group['resolution_numeric'] == min_res]
@@ -195,13 +196,13 @@ def filter_rna3db_json_by_repr_ids(input_json_path: Path, selected_repr_pdb_ids:
 
 def main():
     parser = argparse.ArgumentParser(description="Filter RNA chains, select representatives, and prepare for dataset splitting.")
-    parser.add_argument("analysis_csv", type=Path, help="Path to the CSV file from 02_analyze_rna_chains.py.")
-    parser.add_argument("cluster_json", type=Path, help="Path to the original RNA3DB cluster.json file.")
-    parser.add_argument("output_filtered_selected_csv", type=Path, help="Path to save the CSV with all filtered chains and selection marks.")
-    parser.add_argument("output_selected_clusters_json", type=Path, help="Path to save the new cluster.json containing only selected representative clusters for resplitting.")
+    parser.add_argument("--analysis_csv", type=Path, default=Path("./data/analysis_output/02_rna_chain_analysis.csv"), help="Path to the CSV file from 02_analyze_rna_chains.py.")
+    parser.add_argument("--cluster_json", type=Path, default=Path("./data/RNA3DB_2024-12-04-release_cluster.json"), help="Path to the original RNA3DB cluster.json file.")
+    parser.add_argument("--output_filtered_selected_csv", type=Path, default=Path("./data/analysis_output/03_filtered_selected_chains.csv"), help="Path to save the CSV with all filtered chains and selection marks.")
+    parser.add_argument("--output_selected_clusters_json", type=Path, default=Path("./data/analysis_output/03_selected_clusters.json"), help="Path to save the new cluster.json containing only selected representative clusters for resplitting.")
     parser.add_argument("--min_valid_proportion", type=float, default=0.7, help="Minimum seq_valid_proportion to keep a chain (default: 0.7).")
     parser.add_argument("--random_seed", type=int, default=66, help="Random seed for tie-breaking in representative selection (default: 66).")
-    parser.add_argument("--log_file", type=Path, default=None, help="Optional path to a log file.")
+    parser.add_argument("--log_file", type=Path, default=Path("./data/analysis_output/03_filter_select_chains.log"), help="Optional path to a log file.")
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level.")
 
     args = parser.parse_args()
