@@ -2,6 +2,5 @@ pandas
 tqdm
 rnapolis-py
 mmcif
-pulp # For rna3db's split functionality, if 04_resplit_dataset.sh calls it
-# Note: The 'rna3db' package needs to be installed separately.
-# See README.md for instructions (e.g., pip install rna3db or from its GitHub).
+pulp
+numpy 
