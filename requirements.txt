@@ -1,6 +1,6 @@
 pandas
 tqdm
-rnapolis-py
+RNApolis==0.8.2
 mmcif
 pulp
 numpy 

@@ -21,21 +21,21 @@ The pipeline consists of the following main steps, orchestrated by `run_pipeline
 
 ```mermaid
 graph TD
-    A[Input: cluster.json from RNA3DB release] --> B(Step 1: Download Raw mmCIFs `01_download_raw_mmcif.py`);
-    B --> C(Step 2: Analyze RNA Chains `02_analyze_rna_chains.py`);
+    A[Input: cluster.json from RNA3DB release] --> B(Step 1: Download Raw mmCIFs 01_download_raw_mmcif.py);
+    B --> C(Step 2: Analyze RNA Chains 02_analyze_rna_chains.py);
     C --> D(Output: rna_chain_analysis.csv);
-    A --> E(Step 3: Filter & Select Chains `03_filter_select_chains.py`);
+    A --> E(Step 3: Filter & Select Chains 03_filter_select_chains.py);
     D --> E;
     E --> F(Output: filtered_selected_chains.csv);
     E --> G(Output: selected_clusters.json);
-    G --> H(Step 4: Resplit Dataset `04_resplit_dataset.sh`);
+    G --> H(Step 4: Resplit Dataset 04_resplit_dataset.sh);
     H --> I(Output: resplit_dataset.json);
-    F --> J(Step 5: Assign Dataset Info `05_assign_dataset_info.py`);
+    F --> J(Step 5: Assign Dataset Info 05_assign_dataset_info.py);
     I --> J;
     J --> K(Output: final_selected_seqs_info.csv);
-    K --> L(Step 6: Generate BPSEQ Files `06_generate_bpseq.py`);
+    K --> L(Step 6: Generate BPSEQ Files 06_generate_bpseq.py);
     L --> M[Output BPSEQ files];
-    M --> N(Step 7: Convert to Pickle `07_bpseq_to_pickle.py`);
+    M --> N(Step 7: Convert to Pickle 07_bpseq_to_pickle.py);
     N --> O[Output: Pickle files for ML models];  
 
     subgraph "User Provided Inputs"
@@ -127,7 +127,7 @@ graph TD
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    pip install -r requirements.txt
    ```
-4. **Ensure `batch_download.sh` is executable**:
+3. **Ensure `batch_download.sh` is executable**:
 
    ```bash
    chmod +x ./utils/batch_download.sh
