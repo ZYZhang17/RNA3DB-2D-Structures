@@ -213,10 +213,11 @@ python ./scripts/07_bpseq_to_pickle.py \
   * `final_all_info.csv`: All filtered chains with their assigned dataset.
   * `final_selected_seqs_info.csv`: Only the selected representative chains with their assigned dataset (input for BPSEQ generation).
   * `pickle_files/`: Machine learning ready pickle files
-    * `train_set.pickle`: Training set in pickle format
-    * `valid_set.pickle`: Validation set in pickle format
-    * `test_set.pickle`: Test set in pickle format
-    * `07_bpseq_to_pickle_*.log`: Conversion logs for each dataset
+
+    * `train.pickle`: Training set in pickle format
+    * `valid.pickle`: Validation set in pickle format
+    * `test.pickle`: Test set in pickle format
+    * *Note:* The default pickle files only contain RNA sequences with length  ≤ 600nt (longer sequences are filtered out). If you need to include all sequence lengths in the pickle dataset, please modify the relevant parameter (`max_length`) in `07_bpseq_to_pickle.py` or `PICKLE_MAX_LENGTH` in `run_pipeline.sh` when calling this script.
   * Log files for various steps.
 * **`bpseq_files/`**:
   * `train_set/`: BPSEQ files for the training set.
