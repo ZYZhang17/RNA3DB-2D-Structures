@@ -116,7 +116,7 @@ graph TD
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/your-username/RNA3DB-2D-Structures.git
+   git clone https://github.com/ZYZhang17/RNA3DB-2D-Structures.git
    cd RNA3DB-2D-Structures
    ```
 2. **Install Python dependencies**:
