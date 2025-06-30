@@ -10,7 +10,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-*backup*
+*.backup
+*.backup2
+*.backup3
 
 # Jupyter Notebook
 .ipynb_checkpoints
